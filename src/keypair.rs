@@ -10,6 +10,7 @@ use serde::{de, Deserializer};
 #[cfg(feature = "ecc608")]
 use std::path::Path;
 use std::{collections::HashMap, convert::TryFrom, fmt, fs, io, path, str::FromStr};
+use toml;
 
 #[derive(Debug)]
 pub struct Keypair(helium_crypto::Keypair);
@@ -95,7 +96,7 @@ impl FromStr for Keypair {
                     .host()
                     .map(|dev| Path::new("/dev").join(dev))
                     .ok_or_else(|| uri_error!("missing ecc device path"))?;
-                let config = if let Some(config_file) = args.get_string("config") {
+                let config = if let Some(config_file) = args.get("config", None) {
                     let contents = fs::read_to_string(config_file)?;
                     let config: EccConfig = toml::from_str(&contents)?;
                     Some(config)
