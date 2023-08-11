@@ -95,7 +95,14 @@ impl FromStr for Keypair {
                     .host()
                     .map(|dev| Path::new("/dev").join(dev))
                     .ok_or_else(|| uri_error!("missing ecc device path"))?;
-                let keypair = ecc608::init(&path.to_string_lossy(), bus_address, None)
+                let config = if let Some(config_file) = args.get_string("config") {
+                    let contents = fs::read_to_string(config_file)?;
+                    let config: EccConfig = toml::from_str(&contents)?;
+                    Some(config)
+                } else {
+                    None
+                };
+                let keypair = ecc608::init(&path.to_string_lossy(), bus_address, config)
                     .map_err(|err| {
                         uri_error!(
                             "could not initialize ecc \"{}:{bus_address}\": {err:?}",
