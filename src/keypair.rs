@@ -50,6 +50,12 @@ macro_rules! uri_error {
     };
 }
 
+impl From<toml::de::Error> for error::Error {
+    fn from(err: toml::de::Error) -> Self {
+        uri_error!("invalid uri argument for config: {err:?}")
+    }
+}
+
 impl From<helium_crypto::Keypair> for Keypair {
     fn from(v: helium_crypto::Keypair) -> Self {
         Self(v)
@@ -97,13 +103,14 @@ impl FromStr for Keypair {
                     .host()
                     .map(|dev| Path::new("/dev").join(dev))
                     .ok_or_else(|| uri_error!("missing ecc device path"))?;
-                let config = if let Some(config_file) = args.get("config", None) {
+                let config: Option<EccConfig>;
+                let config_file = args.get("config", String::from("none"))?;
+                if config_file == "none" {
+                    config = None;
+                 } else {
                     let contents = fs::read_to_string(config_file)?;
-                    let config: EccConfig = toml::from_str(&contents)?;
-                    Some(config)
-                } else {
-                    None
-                };
+                    config = Some(toml::from_str(&contents)?);
+                }
                 let keypair = ecc608::init(&path.to_string_lossy(), bus_address, config)
                     .map_err(|err| {
                         uri_error!(
