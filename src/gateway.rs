@@ -1,185 +1,352 @@
-use crate::{router::dispatcher, Error, Packet, Result, Settings};
-use futures::TryFutureExt;
-use semtech_udp::{
-    server_runtime::{Error as SemtechError, Event, UdpRuntime},
-    tx_ack, MacAddress,
+use crate::{
+    beaconer, packet, packet_router, region_watcher, sync, PacketDown, PacketUp, PublicKey,
+    RegionParams, Result, Settings,
 };
-use slog::{debug, info, o, warn, Logger};
-use std::{convert::TryFrom, time::Duration};
-use tokio::sync::mpsc;
+use beacon::Beacon;
+use lorawan::PHYPayload;
+use semtech_udp::{
+    pull_resp::{self, Time},
+    server_runtime::{Error as SemtechError, Event, UdpRuntime},
+    tx_ack,
+    tx_ack::Error as TxAckErr,
+    CodingRate, MacAddress, Modulation,
+};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 
-pub const DOWNLINK_TIMEOUT_SECS: u64 = 5;
-pub const UPLINK_TIMEOUT_SECS: u64 = 6;
+pub const DOWNLINK_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+pub struct BeaconResp {
+    pub powe: i32,
+    pub tmst: u32,
+}
 
 #[derive(Debug)]
 pub enum Message {
-    Downlink(Packet),
+    Downlink(PacketDown),
+    TransmitBeacon(Beacon, sync::ResponseSender<Result<BeaconResp>>),
 }
 
-#[derive(Clone, Debug)]
-pub struct MessageSender(mpsc::Sender<Message>);
-pub type MessageReceiver = mpsc::Receiver<Message>;
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayError {
+    #[error("unknown beacon tx power")]
+    NoBeaconTxPower,
+    #[error("beacon transmit failed")]
+    BeaconTxFailure,
+}
 
-pub fn message_channel(size: usize) -> (MessageSender, MessageReceiver) {
-    let (tx, rx) = mpsc::channel(size);
-    (MessageSender(tx), rx)
+pub type MessageSender = sync::MessageSender<Message>;
+pub type MessageReceiver = sync::MessageReceiver<Message>;
+
+pub fn message_channel() -> (MessageSender, MessageReceiver) {
+    sync::message_channel(10)
 }
 
 impl MessageSender {
-    pub async fn downlink(&self, packet: Packet) -> Result {
-        self.0
-            .send(Message::Downlink(packet))
-            .map_err(|_| Error::channel())
-            .await
+    pub async fn downlink(&self, packet: PacketDown) {
+        self.send(Message::Downlink(packet)).await
+    }
+
+    /// Send a non-inverted (`ipol = false`) beacon packet that is receivable by
+    /// other gateways.
+    ///
+    /// Essentially, this packet looks like a regular uplink packet to other
+    /// gateways until further inspection.
+    pub async fn transmit_beacon(&self, beacon: Beacon) -> Result<BeaconResp> {
+        self.request(move |tx| Message::TransmitBeacon(beacon, tx))
+            .await?
     }
 }
 
 pub struct Gateway {
-    uplinks: dispatcher::MessageSender,
+    public_key: PublicKey,
     messages: MessageReceiver,
+    uplinks: packet_router::MessageSender,
+    beacons: beaconer::MessageSender,
     downlink_mac: MacAddress,
     udp_runtime: UdpRuntime,
     listen_address: String,
+    region_watch: region_watcher::MessageReceiver,
+    region_params: RegionParams,
 }
 
 impl Gateway {
     pub async fn new(
-        uplinks: dispatcher::MessageSender,
-        messages: MessageReceiver,
         settings: &Settings,
+        messages: MessageReceiver,
+        region_watch: region_watcher::MessageReceiver,
+        uplinks: packet_router::MessageSender,
+        beacons: beaconer::MessageSender,
     ) -> Result<Self> {
+        let region_params = region_watcher::current_value(&region_watch);
+        let public_key = settings.keypair.public_key().clone();
         let gateway = Gateway {
-            uplinks,
-            downlink_mac: Default::default(),
+            public_key,
             messages,
+            uplinks,
+            beacons,
+            downlink_mac: Default::default(),
             listen_address: settings.listen.clone(),
-            udp_runtime: UdpRuntime::new(&settings.listen).await?,
+            udp_runtime: UdpRuntime::new(&settings.listen).await.map_err(Box::new)?,
+            region_watch,
+            region_params,
         };
         Ok(gateway)
     }
 
-    pub async fn run(&mut self, shutdown: triggered::Listener, logger: &Logger) -> Result {
-        let logger = logger.new(o!("module" => "gateway"));
-        info!(logger, "starting"; "listen" => &self.listen_address);
+    pub async fn run(&mut self, shutdown: &triggered::Listener) -> Result {
+        info!(listen = &self.listen_address, "starting");
         loop {
             tokio::select! {
                 _ = shutdown.clone() => {
-                    info!(logger, "shutting down");
+                    info!( "shutting down");
                     return Ok(())
                 },
                 event = self.udp_runtime.recv() =>
-                    self.handle_udp_event(&logger, event).await?,
+                    self.handle_udp_event(event).await?,
                 message = self.messages.recv() => match message {
-                    Some(message) => self.handle_message(&logger, message).await,
+                    Some(message) => self.handle_message(message).await,
                     None => {
-                        warn!(logger, "ignoring closed downlinks channel");
+                        warn!("ignoring closed message channel");
                         continue;
                     }
-                }
+                },
+                region_change = self.region_watch.changed() => match region_change {
+                    Ok(()) => {
+                        self.region_params = region_watcher::current_value(&self.region_watch);
+                        info!(region = RegionParams::to_string(&self.region_params), "region updated");
+                    }
+                    Err(_) => warn!("region watch disconnected")
+                },
             }
         }
     }
 
-    async fn handle_udp_event(&mut self, logger: &Logger, event: Event) -> Result {
+    async fn handle_udp_event(&mut self, event: Event) -> Result {
         match event {
             Event::UnableToParseUdpFrame(e, buf) => {
-                warn!(
-                    logger,
-                    "ignoring semtech udp parsing error {e}, raw bytes {buf:?}"
-                );
+                warn!(raw_bytes = ?buf, "ignoring semtech udp parsing error {e}");
             }
             Event::NewClient((mac, addr)) => {
-                info!(logger, "new packet forwarder client: {mac}, {addr}");
+                info!(%mac, %addr, "new packet forwarder client");
                 self.downlink_mac = mac;
             }
             Event::UpdateClient((mac, addr)) => {
-                info!(logger, "mac existed, but IP updated: {mac}, {addr}")
+                info!(%mac, %addr, "mac existed, but IP updated")
             }
             Event::ClientDisconnected((mac, addr)) => {
-                info!(logger, "disconnected packet forwarder: {mac}, {addr}")
+                info!(%mac, %addr, "disconnected packet forwarder")
             }
-            Event::PacketReceived(rxpk, _gateway_mac) => match Packet::try_from(rxpk) {
-                Ok(packet) if packet.is_longfi() => {
-                    info!(logger, "ignoring longfi packet");
+            Event::PacketReceived(rxpk, _gateway_mac) => {
+                match PacketUp::from_rxpk(rxpk, &self.public_key, self.region_params.region) {
+                    Ok(packet) if packet.is_potential_beacon() => {
+                        self.handle_potential_beacon(packet).await;
+                    }
+                    Ok(packet) if packet.is_uplink() => {
+                        self.handle_uplink(packet, Instant::now()).await
+                    }
+                    Ok(packet) => {
+                        info!(%packet, "ignoring non-uplink packet");
+                    }
+                    Err(err) => {
+                        warn!(%err, "ignoring push_data");
+                    }
                 }
-                Ok(packet) => self.handle_uplink(logger, packet).await,
-                Err(err) => {
-                    warn!(logger, "ignoring push_data: {err:?}");
-                }
-            },
+            }
             Event::NoClientWithMac(_packet, mac) => {
-                info!(logger, "ignoring send to client with unknown MAC: {mac}")
+                info!(%mac, "ignoring send to client with unknown MAC")
             }
             Event::StatReceived(stat, mac) => {
-                debug!(logger, "mac: {mac}, stat: {stat:?}")
+                debug!(%mac, ?stat, "received stat")
             }
         };
         Ok(())
     }
 
-    async fn handle_uplink(&mut self, logger: &Logger, packet: Packet) {
-        info!(logger, "uplink {} from {}", packet, self.downlink_mac);
-        match self.uplinks.uplink(packet).await {
-            Ok(()) => (),
-            Err(err) => warn!(logger, "ignoring uplink error {:?}", err),
+    async fn handle_potential_beacon(&mut self, packet: PacketUp) {
+        if self.region_params.is_unknown() {
+            info!(downlink_mac = %self.downlink_mac, uplink = %packet, "ignored potential beacon, no region");
+            return;
         }
+        info!(downlink_mac = %self.downlink_mac, uplink = %packet, "received potential beacon");
+        self.beacons.received_beacon(packet).await
     }
 
-    async fn handle_message(&mut self, logger: &Logger, message: Message) {
+    async fn handle_uplink(&mut self, packet: PacketUp, received: Instant) {
+        if self.region_params.is_unknown() {
+            info!(
+                downlink_mac = %self.downlink_mac,
+                uplink = %packet,
+                region = %self.region_params,
+                "ignored uplink");
+            return;
+        }
+        info!(
+            downlink_mac = %self.downlink_mac,
+            uplink = %packet,
+            region = %self.region_params,
+            "received uplink");
+        self.uplinks.uplink(packet, received).await;
+    }
+
+    async fn handle_message(&mut self, message: Message) {
         match message {
-            Message::Downlink(packet) => self.handle_downlink(logger, packet).await,
+            Message::Downlink(packet) => self.handle_downlink(packet).await,
+            Message::TransmitBeacon(beacon, tx_resp) => {
+                self.handle_transmit_beacon(beacon, tx_resp).await
+            }
         }
     }
 
-    async fn handle_downlink(&mut self, logger: &Logger, downlink: Packet) {
+    fn max_tx_power(&mut self) -> Result<u32> {
+        Ok(self.region_params.max_conducted_power()?)
+    }
+
+    async fn handle_transmit_beacon(
+        &mut self,
+        beacon: Beacon,
+        responder: sync::ResponseSender<Result<BeaconResp>>,
+    ) {
+        let tx_power = match self.max_tx_power() {
+            Ok(tx_power) => tx_power,
+            Err(err) => {
+                warn!(%err, "beacon transmit");
+                responder.send(Err(err));
+                return;
+            }
+        };
+
+        let packet = match beacon_to_pull_resp(&beacon, tx_power as u64) {
+            Ok(packet) => packet,
+            Err(err) => {
+                warn!(%err, "failed to construct beacon pull resp");
+                responder.send(Err(err));
+                return;
+            }
+        };
+
+        let beacon_tx = self.udp_runtime.prepare_downlink(packet, self.downlink_mac);
+
+        tokio::spawn(async move {
+            let beacon_id = beacon.beacon_id();
+            match beacon_tx.dispatch(Some(DOWNLINK_TIMEOUT)).await {
+                Ok(tmst) => {
+                    info!(
+                        beacon_id,
+                        %tx_power,
+                        ?tmst,
+                        "beacon transmitted"
+                    );
+                    responder.send(Ok(BeaconResp {
+                        powe: tx_power as i32,
+                        tmst: tmst.unwrap_or(0),
+                    }));
+                    tmst
+                }
+                Err(err) => {
+                    if let semtech_udp::server_runtime::Error::Ack(
+                        tx_ack::Error::AdjustedTransmitPower(power_used, tmst),
+                    ) = err
+                    {
+                        match power_used {
+                            None => {
+                                warn!("packet transmitted with adjusted power, but packet forwarder does not indicate power used.");
+                                responder.send(Err(GatewayError::NoBeaconTxPower.into()));
+                            }
+                            Some(actual_power) => {
+                                info!(
+                                    beacon_id,
+                                    actual_power,
+                                    ?tmst,
+                                    "beacon transmitted with adjusted power output",
+                                );
+                                responder.send(Ok(BeaconResp {
+                                    powe: actual_power,
+                                    tmst: tmst.unwrap_or(0),
+                                }));
+                            }
+                        }
+                        tmst
+                    } else {
+                        warn!(beacon_id, %err, "failed to transmit beacon");
+                        responder.send(Err(GatewayError::BeaconTxFailure.into()));
+                        None
+                    }
+                }
+            }
+        });
+    }
+
+    async fn handle_downlink(&mut self, downlink: PacketDown) {
+        let tx_power = match self.max_tx_power() {
+            Ok(tx_power) => tx_power,
+            Err(err) => {
+                warn!(%err, "downlink transmit");
+                return;
+            }
+        };
+
         let (mut downlink_rx1, mut downlink_rx2) = (
             // first downlink
             self.udp_runtime.prepare_empty_downlink(self.downlink_mac),
             // 2nd downlink window if requested by the router response
             self.udp_runtime.prepare_empty_downlink(self.downlink_mac),
         );
-        let logger = logger.clone();
+
+        let downlink_mac = self.downlink_mac;
+
         tokio::spawn(async move {
-            match downlink.to_pull_resp(false).unwrap() {
-                None => (),
-                Some(txpk) => {
-                    info!(
-                        logger,
-                        "rx1 downlink {} via {}",
-                        txpk,
-                        downlink_rx1.get_destination_mac()
-                    );
-                    downlink_rx1.set_packet(txpk);
-                    match downlink_rx1
-                        .dispatch(Some(Duration::from_secs(DOWNLINK_TIMEOUT_SECS)))
-                        .await
-                    {
-                        // On a too early or too late error retry on the rx2 slot if available.
-                        Err(SemtechError::Ack(tx_ack::Error::TooEarly))
-                        | Err(SemtechError::Ack(tx_ack::Error::TooLate)) => {
-                            if let Some(txpk) = downlink.to_pull_resp(true).unwrap() {
-                                info!(
-                                    logger,
-                                    "rx2 downlink {} via {}",
-                                    txpk,
-                                    downlink_rx2.get_destination_mac()
-                                );
-                                downlink_rx2.set_packet(txpk);
-                                if let Err(err) = downlink_rx2
-                                    .dispatch(Some(Duration::from_secs(DOWNLINK_TIMEOUT_SECS)))
-                                    .await
-                                {
-                                    warn!(logger, "ignoring rx2 downlink error: {:?}", err);
+            if let Ok(txpk) = downlink.to_rx1_pull_resp(tx_power) {
+                info!(%downlink_mac, "rx1 downlink {txpk}",);
+
+                downlink_rx1.set_packet(txpk);
+                match downlink_rx1.dispatch(Some(DOWNLINK_TIMEOUT)).await {
+                    // On a too early or too late error retry on the rx2 slot if available.
+                    Err(SemtechError::Ack(TxAckErr::TooEarly | TxAckErr::TooLate)) => {
+                        if let Ok(Some(txpk)) = downlink.to_rx2_pull_resp(tx_power) {
+                            info!(%downlink_mac, "rx2 downlink {txpk}");
+
+                            downlink_rx2.set_packet(txpk);
+                            match downlink_rx2.dispatch(Some(DOWNLINK_TIMEOUT)).await {
+                                Err(SemtechError::Ack(TxAckErr::AdjustedTransmitPower(_, _))) => {
+                                    warn!("rx2 downlink sent with adjusted transmit power");
                                 }
+                                Err(err) => warn!(%err, "ignoring rx2 downlink error"),
+                                _ => (),
                             }
                         }
-                        Err(err) => {
-                            warn!(logger, "ignoring rx1 downlink error: {:?}", err);
-                        }
-                        Ok(()) => (),
                     }
+                    Err(SemtechError::Ack(TxAckErr::AdjustedTransmitPower(_, _))) => {
+                        warn!("rx1 downlink sent with adjusted transmit power");
+                    }
+                    Err(err) => {
+                        warn!(%err, "ignoring rx1 downlink error");
+                    }
+                    Ok(_) => (),
                 }
             }
         });
     }
+}
+
+pub fn beacon_to_pull_resp(beacon: &Beacon, tx_power: u64) -> Result<pull_resp::TxPk> {
+    let datr = packet::datarate::from_proto(beacon.datarate)?;
+    let freq = packet::to_mhz(beacon.frequency as f64);
+    let data: Vec<u8> = PHYPayload::proprietary(beacon.data.as_slice()).try_into()?;
+
+    Ok(pull_resp::TxPk {
+        time: Time::immediate(),
+        ipol: false,
+        modu: Modulation::LORA,
+        codr: CodingRate::_4_5,
+        datr,
+        freq,
+        data: pull_resp::PhyData::new(data),
+        powe: tx_power,
+        rfch: 0,
+        fdev: None,
+        prea: None,
+        ncrc: None,
+    })
 }

@@ -1,9 +1,5 @@
-mod msg_sign;
-mod msg_verify;
-mod txn_envelope;
+mod base64;
 mod txn_fee;
 
-pub use msg_sign::MsgSign;
-pub use msg_verify::MsgVerify;
-pub use txn_envelope::TxnEnvelope;
-pub use txn_fee::{TxnFee, TxnFeeConfig, CONFIG_FEE_KEYS};
+pub(crate) use self::base64::Base64;
+pub(crate) use txn_fee::{TxnFee, TxnFeeConfig};
