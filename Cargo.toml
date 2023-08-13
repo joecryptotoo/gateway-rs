@@ -79,6 +79,7 @@ helium-crypto = { git = "https://github.com/joecryptotoo/helium-crypto-rs.git", 
 [features]
 default = ["ecc608"]
 ecc608 = ["helium-crypto/ecc608"]
+raspi = ["ecc608", "helium-crypto/raspi"]
 tpm = ["helium-crypto/tpm"]
 
 [profile.release]
