@@ -110,6 +110,7 @@ impl FromStr for Keypair {
                  } else {
                     let contents = fs::read_to_string(config_file)?;
                     config = Some(toml::from_str(&contents)?);
+                    println!("Config value: {:?}", config);
                 }
                 let keypair = ecc608::init(&path.to_string_lossy(), bus_address, config)
                     .map_err(|err| {
