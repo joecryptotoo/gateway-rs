@@ -1,6 +1,8 @@
 use crate::*;
 #[cfg(feature = "ecc608")]
 use helium_crypto::ecc608;
+#[cfg(feature = "ecc608")]
+use helium_crypto::ecc608::EccConfig;
 #[cfg(feature = "tpm")]
 use helium_crypto::tpm;
 use helium_crypto::{KeyTag, KeyType, Network};
