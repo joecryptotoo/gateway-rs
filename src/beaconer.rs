@@ -206,9 +206,13 @@ impl Beaconer {
         &self,
         packet: PacketUp,
     ) -> Result<poc_lora::LoraWitnessReportReqV1> {
+        let mut total_duration = Duration::new(0, 0);
+        let start = Instant::now();
         let mut report = poc_lora::LoraWitnessReportReqV1::try_from(packet)?;
         report.pub_key = self.keypair.public_key().to_vec();
         report.signature = sign(self.keypair.clone(), report.encode_to_vec()).await?;
+        total_duration += start.elapsed();
+        info!("signing took {:?}", total_duration);
         Ok(report)
     }
 
