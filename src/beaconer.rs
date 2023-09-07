@@ -225,7 +225,7 @@ impl Beaconer {
         report.pub_key = self.keypair.public_key().to_vec();
         report.signature = sign(self.keypair.clone(), report.encode_to_vec()).await?;
         total_duration += start.elapsed();
-        info!("signing took {:?}", total_duration.as_millis());
+        info!("signing took {:?}ms", (total_duration.subsec_nanoseconds() / 1_000_000));
         Ok(report)
     }
 
@@ -282,7 +282,7 @@ impl Beaconer {
                     .inspect_ok(|_| info!(beacon_id, "poc witness report submitted"))
                     .await;
                 total_duration += start.elapsed();
-                info!("poc submission took {:?}", total_duration.as_millis());
+                info!("poc submission took {:?}ms", (total_duration.subsec_nanoseconds() / 1_000_000));
             }
             Err(err) => {
                 warn!(%err, "poc witness report");
