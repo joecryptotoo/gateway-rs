@@ -76,12 +76,17 @@ semtech-udp = { version = ">=0.11", default-features = false, features = [
 ] }
 helium-crypto = { git = "https://github.com/joecryptotoo/helium-crypto-rs.git", branch = "joecryptotoo/wake_fix" }
 toml = { version = "0" }
+time = { version = ">=0.3", features = ["std"] }
 
 [features]
 default = ["ecc608"]
 ecc608 = ["helium-crypto/ecc608"]
 raspi = ["ecc608", "helium-crypto/raspi"]
 tpm = ["helium-crypto/tpm"]
+
+[dev-dependencies]
+time = { version = ">=0.3", features = ["std", "macros"] }
+
 
 [profile.release]
 opt-level = "z"
