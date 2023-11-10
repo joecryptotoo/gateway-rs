@@ -1,4 +1,4 @@
-use crate::{error::DecodeError, Error, PublicKey, Region, Result};
+use crate::{DecodeError, Error, PublicKey, Region, Result};
 use helium_proto::services::{
     poc_lora,
     router::{PacketRouterPacketDownV1, PacketRouterPacketUpV1},
@@ -17,7 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PacketUp(PacketRouterPacketUpV1);
 
 #[derive(Debug, Clone)]
@@ -65,12 +65,8 @@ impl fmt::Display for PacketUp {
 impl TryFrom<PacketUp> for poc_lora::LoraWitnessReportReqV1 {
     type Error = Error;
     fn try_from(value: PacketUp) -> Result<Self> {
-        let payload = match PacketUp::parse_frame(Direction::Uplink, value.payload()) {
-            Ok(PHYPayloadFrame::Proprietary(payload)) => payload,
-            _ => return Err(DecodeError::not_beacon()),
-        };
         let report = poc_lora::LoraWitnessReportReqV1 {
-            data: payload.to_vec(),
+            data: vec![],
             tmst: value.0.timestamp as u32,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -89,9 +85,12 @@ impl TryFrom<PacketUp> for poc_lora::LoraWitnessReportReqV1 {
 
 impl PacketUp {
     pub fn from_rxpk(rxpk: push_data::RxPk, gateway: &PublicKey, region: Region) -> Result<Self> {
-        if rxpk.get_crc_status() != &CRC::OK {
-            return Err(DecodeError::invalid_crc());
+        match rxpk.get_crc_status() {
+            CRC::OK => (),
+            CRC::Disabled => return Err(DecodeError::crc_disabled()),
+            CRC::Fail => return Err(DecodeError::crc_invalid()),
         }
+
         let rssi = rxpk
             .get_signal_rssi()
             .unwrap_or_else(|| rxpk.get_channel_rssi());
