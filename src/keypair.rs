@@ -1,6 +1,8 @@
 use crate::{DecodeError, Error, Result};
 #[cfg(feature = "ecc608")]
 use helium_crypto::ecc608;
+#[cfg(feature = "ecc608")]
+use helium_crypto::ecc608::EccConfig;
 #[cfg(feature = "tpm")]
 use helium_crypto::tpm;
 use helium_crypto::{KeyTag, KeyType, Network};
@@ -11,6 +13,7 @@ use serde::{de, Deserializer};
 use std::path::Path;
 use std::{collections::HashMap, convert::TryFrom, fmt, fs, io, path, str::FromStr};
 use tonic::async_trait;
+use toml;
 
 #[derive(Debug)]
 pub struct Keypair(helium_crypto::Keypair);
@@ -34,6 +37,12 @@ macro_rules! uri_error {
     ($format:expr, $( $arg:expr ),+ ) => {
         DecodeError::keypair_uri(format!($format, $( $arg ),+))
     };
+}
+
+impl From<toml::de::Error> for error::Error {
+    fn from(err: toml::de::Error) -> Self {
+        uri_error!("invalid uri argument for config: {err:?}")
+    }
 }
 
 impl From<helium_crypto::Keypair> for Keypair {
@@ -83,7 +92,16 @@ impl FromStr for Keypair {
                     .host()
                     .map(|dev| Path::new("/dev").join(dev))
                     .ok_or_else(|| uri_error!("missing ecc device path"))?;
-                let keypair = ecc608::init(&path.to_string_lossy(), bus_address, None)
+                let config: Option<EccConfig>;
+                let config_file = args.get("config", String::from("none"))?;
+                if config_file == "none" {
+                    config = None;
+                 } else {
+                    let contents = fs::read_to_string(config_file)?;
+                    config = Some(toml::from_str(&contents)?);
+                    println!("Config value: {:?}", config);
+                }
+                let keypair = ecc608::init(&path.to_string_lossy(), bus_address, config)
                     .map_err(|err| {
                         uri_error!(
                             "could not initialize ecc \"{}:{bus_address}\": {err:?}",

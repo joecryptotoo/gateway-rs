@@ -76,6 +76,7 @@ semtech-udp = { version = ">=0.11", default-features = false, features = [
     "server",
 ] }
 helium-crypto = { git = "https://github.com/joecryptotoo/helium-crypto-rs.git", branch = "joecryptotoo/wake_fix" }
+toml = { version = "0" }
 time = { version = ">=0.3", features = ["std"] }
 
 [features]
