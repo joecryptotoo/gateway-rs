@@ -65,7 +65,7 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-Clink-self-contained=yes
 
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-Ctarget-feature=-crt-static"
 
-RUN cargo build --release $(cat cargo_flags.txt)
+RUN cargo build --release $(cat cargo_flags.txt) -F raspi
 RUN mv target/$(cat rust_target.txt)/release/helium_gateway .
 
 

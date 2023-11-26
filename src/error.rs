@@ -55,8 +55,10 @@ pub enum DecodeError {
     Prost(#[from] prost::DecodeError),
     #[error("lorawan decode: {0}")]
     LoraWan(#[from] lorawan::LoraWanError),
-    #[error("packet crc")]
-    InvalidCrc,
+    #[error("crc is invalid and packet may be corrupted")]
+    CrcInvalid,
+    #[error("crc is disabled")]
+    CrcDisabled,
     #[error("unexpected transaction in envelope")]
     InvalidEnvelope,
     #[error("no rx1 window in downlink packet")]
@@ -77,8 +79,8 @@ pub enum ServiceError {
     Stream,
     #[error("channel closed")]
     Channel,
-    #[error("no service")]
-    NoService,
+    #[error("no active session")]
+    NoSession,
     #[error("age {age}s > {max_age}s")]
     Check { age: u64, max_age: u64 },
     #[error("Unable to connect to local server. Check that `helium_gateway` is running.")]
@@ -128,8 +130,12 @@ impl DecodeError {
         Error::Decode(DecodeError::InvalidEnvelope)
     }
 
-    pub fn invalid_crc() -> Error {
-        Error::Decode(DecodeError::InvalidCrc)
+    pub fn crc_invalid() -> Error {
+        Error::Decode(DecodeError::CrcInvalid)
+    }
+
+    pub fn crc_disabled() -> Error {
+        Error::Decode(DecodeError::CrcInvalid)
     }
 
     pub fn prost_decode(msg: &'static str) -> Error {
@@ -170,8 +176,12 @@ impl Error {
         Error::Service(ServiceError::Channel)
     }
 
-    pub fn no_service() -> Error {
-        Error::Service(ServiceError::NoService)
+    pub fn no_session() -> Error {
+        Error::Service(ServiceError::NoSession)
+    }
+
+    pub fn no_stream() -> Error {
+        Error::Service(ServiceError::Stream)
     }
 
     pub fn gateway_service_check(age: u64, max_age: u64) -> Error {
